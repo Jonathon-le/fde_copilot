@@ -2,7 +2,7 @@
 
 企业知识库 + 工单 Agent：本地知识库检索、工单管理、可人工确认的 Agent 写操作。
 
-当前进度：**M0–M8 完成**（RAG 检索 → 混合召回 → HTTP 服务 → Agent 与确认 → 流式界面）。
+当前进度：**M0–M9 完成**（RAG 检索 → 混合召回 → HTTP 服务 → Agent 与确认 → 流式界面 → 观测与评测）。
 
 ## 快速开始
 
@@ -40,6 +40,8 @@ python -m streamlit run app/ui/streamlit_app.py
 | PATCH | `/tickets/{id}/status` | 更新状态（非法流转 409） |
 | POST | `/agent/chat` | Agent 对话（可提议写操作） |
 | POST | `/agent/confirm` | 确认 / 拒绝待执行操作（幂等） |
+| GET | `/traces` | 最近调用记录（可按类型过滤） |
+| GET | `/metrics/summary` | 调用数、状态分布、p50/p95 延迟 |
 
 ## 设计要点
 
@@ -48,8 +50,17 @@ python -m streamlit run app/ui/streamlit_app.py
 - **Agent 安全**：读工具自动执行；写工具只生成 `pending_actions`，必须经 `/agent/confirm` 才落库，重复确认幂等。
 - **前端**：Streamlit 只作为 HTTP 客户端，不 import 业务模块。
 
+## 测试与评测
+
+```powershell
+python -m pytest -q                    # 8 个测试，不联网、不调模型
+python -m scripts.eval_retrieval       # 三种检索模式 hit@1 / recall@k
+python -m scripts.calibrate_relevance  # 相关性门槛校准（当前结论：不可分）
+python -m scripts.eval_report          # 生成 data/eval/report.md
+```
+
 ## 已知限制
 
-- 库外问题没有相关性门槛，仍会返回 top-k 片段（由模型按 prompt 拒答）。
+- 库外问题没有相关性门槛（评测集上 absent 与 in-domain 分数重叠，无法定阈值），仍会返回 top-k 片段，由模型按 prompt 拒答；可设 `RELEVANCE_MIN_SCORE` 强制开启，但会误拒正常问题。
 - Agent 没有跨轮对话历史，`session_id` 只用于绑定待确认操作。
 - 本地单机项目，未做鉴权、限流与多用户隔离。

@@ -106,7 +106,7 @@ with st.sidebar:
     mode = st.selectbox("检索模式", ["hybrid", "vector", "bm25"], index=0)
     st.caption("hybrid = 向量 + BM25 用 RRF 融合（M5）")
 
-tab_ask, tab_tickets, tab_agent = st.tabs(["💬 知识问答", "🎫 工单", "🤖 Agent"])
+tab_ask, tab_tickets, tab_agent, tab_obs = st.tabs(["💬 知识问答", "🎫 工单", "🤖 Agent", "📈 观测"])
 
 
 # ==================== Tab 1：流式知识问答 ====================
@@ -369,3 +369,65 @@ with tab_agent:
         st.session_state.agent_history = []
         st.session_state.agent_pending = None
         st.rerun()
+
+
+# ==================== Tab 4：观测（M9） ====================
+# 这一页只读 /traces 和 /metrics/summary。
+# 为什么把它放前端而不是只看数据库：排查问题时想看"刚才那次调用发生了什么"，
+# 打开网页点两下比写 SQL 快得多。
+with tab_obs:
+    st.subheader("调用观测")
+    st.caption("trace 只存摘要（命中、引用数、耗时、状态），不存答案全文。")
+
+    if st.button("刷新", key="refresh_obs"):
+        st.rerun()
+
+    try:
+        summary = api("GET", "/metrics/summary")
+    except ApiError as exc:
+        summary = {}
+        st.error(f"读取指标失败：{exc}")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("总调用数", summary.get("count", 0))
+    c2.metric("p50 延迟", f"{summary.get('latency_p50_ms') or '-'} ms")
+    c3.metric("p95 延迟", f"{summary.get('latency_p95_ms') or '-'} ms")
+    c4.metric("状态分布", ", ".join(f"{k}:{v}" for k, v in (summary.get("by_status") or {}).items()) or "-")
+
+    if (summary.get("count") or 0) < 20:
+        st.caption("样本少于 20 条时 p95 意义有限，先多跑几次再看。")
+
+    st.markdown("**按类型分布**：" + (", ".join(
+        f"{k}: {v}" for k, v in (summary.get("by_kind") or {}).items()) or "-"))
+
+    kind = st.selectbox("筛选类型", ["全部", "ask", "ask_stream", "agent_chat", "agent_confirm"])
+    params = {"limit": 50}
+    if kind != "全部":
+        params["kind"] = kind
+
+    try:
+        traces = api("GET", "/traces", params=params)
+    except ApiError as exc:
+        traces = []
+        st.error(f"读取 trace 失败：{exc}")
+
+    if traces:
+        st.dataframe(
+            [
+                {
+                    "id": t["id"], "类型": t["kind"], "状态": t["status"],
+                    "耗时ms": t["latency_ms"], "步数": t["steps"],
+                    "query": (t["query"] or "")[:40], "时间": t["created_at"],
+                }
+                for t in traces
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+        selected_id = st.selectbox("查看详情", [t["id"] for t in traces])
+        try:
+            st.json(api("GET", f"/traces/{selected_id}"))
+        except ApiError as exc:
+            st.error(f"读取详情失败：{exc}")
+    else:
+        st.info("还没有调用记录。去问一个问题，或者跑一次 Agent。")

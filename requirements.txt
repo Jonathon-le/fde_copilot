@@ -7,3 +7,4 @@ jieba
 rank-bm25
 pypdf
 httpx
+pytest

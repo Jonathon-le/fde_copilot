@@ -6835,3 +6835,52 @@ AppTest 注入 pending       → 警告 + JSON 参数 + 同意/拒绝按钮渲�
 - `README.md` 原文还停留在"M1 完成"，已更新。
 
 **已知限制**：Agent 未流式（工具调用与文本增量混流的复杂度留后）；无跨轮历史；单用户无鉴权；刷新丢前端历史但 pending 在库。
+
+### 11.37 M7-M8 提交（2026-11-18）
+
+`git add -A` 后核对：14 个文件、1407 行新增；`git ls-files` 中确认没有 `models/`、`data/chroma/`、`data/app.db`。
+
+```text
+60f3b44 M7-M8: Agent 确认流程、流式问答与 Streamlit 界面
+6df8d55 M0-M6: 完成 RAG 检索与 FastAPI 服务，M7 进行中
+```
+
+提交后 `git status` 为空，工作区干净。LF→CRLF 警告可忽略。
+
+### 11.38 M9 完成：观测、评测与相关性门槛结论（2026-11-18）
+
+**新增文件**
+| 文件 | 内容 |
+|---|---|
+| `app/obs/trace.py` | `record_trace`（请求内连接）、`record_trace_detached`（流式独立连接）、`timed()` |
+| `app/rag/relevance.py` | `is_relevant()`：`RELEVANCE_MIN_SCORE` 环境变量，默认 0 = 关闭 |
+| `scripts/calibrate_relevance.py` | 每条 query 的 vector/BM25 top1 分数 + 可分性判定 |
+| `scripts/eval_report.py` | 生成 `data/eval/report.md`（复用 eval_retrieval 与 calibrate 的计算） |
+| `tests/test_core.py` | 8 个测试，pytest 全绿 |
+| `data/eval/report.md` | 脚本生成的评测报告 |
+
+**修改**：`schema.sql`（traces 表）、`repositories.py`（create_trace/list_traces/get_trace/trace_stats + p50/p95）、`api/main.py`（四个接口埋点 + `/traces` `/traces/{id}` `/metrics/summary`）、`streamlit_app.py`（第四个"观测"标签页）、`requirements.txt`（pytest）、README、LEARNING_PLAN、M9.md。
+
+**两个关键设计**
+1. **流式 trace 不能用请求级连接**：`yield` 依赖在路由返回时关闭，而流式响应在返回后才生成 → `Cannot operate on a closed database`。`record_trace_detached` 自己开短连接。
+2. **trace 只存摘要**：`payload` 记 hits 数、top_doc、citations 数、错误**类型名**；不存答案全文、不存 header/key。写 trace 用 try/except 包住，失败不影响主请求。
+
+**相关性门槛：实测结论是"不可分"**
+```text
+absent    vector top1: 0.4705 / 0.5488 / 0.5842     bm25: 0 / 0 / 2.885
+in-domain vector top1: 0.5728 ~ 0.7399             bm25: 1.252 ~ 10.475
+absent max 0.5842 > in-domain min 0.5728  → 重叠，无单一阈值
+```
+因此门槛实现为**默认关闭**；强行设 0.58 会误拒 q06 同时放过 q13。改进方向：扩大语料与评测集、或 LLM 判定相关性。
+
+**实测**
+```text
+/ask                         → trace(ask, ok, 1662ms, {"hits":4,"top_doc":"发票与报销","citations":1})
+/ask/stream                  → trace(ask_stream, ok, 1561ms, {"hits":3,"citations":2})
+/agent/chat                  → trace(agent_chat, ok, 3532ms, steps=1)
+/agent/confirm(reject)       → trace(agent_confirm, rejected, 1ms)
+/metrics/summary             → count 4, by_kind 全 4 种, by_status {ok:3, rejected:1}, p50 1561, p95 3532
+RELEVANCE_MIN_SCORE=0.99 /ask→ 200 "资料中没有提到这个问题。"，0.48s，trace(ask, refused, gate.top_score=0.6369)
+pytest -q                    → 8 passed（tokenize 幂等、rrf 去重、closed→open 拒绝、pending 幂等、越权 404、/ask 422、citations+trace、trace 接口）
+Streamlit AppTest            → 4 tabs，4 个 metric，2 个 dataframe，0 异常
+```

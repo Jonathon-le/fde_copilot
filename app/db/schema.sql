@@ -65,3 +65,18 @@ CREATE TABLE IF NOT EXISTS pending_actions(
 );
 -- 按会话+状态查：确认页要列出待办，限流也要用它
 CREATE INDEX IF NOT EXISTS idx_pending_session ON pending_actions(session_id, status);
+
+-- 观测：每次调用一条摘要记录（诊断用，不是备份，不存完整答案）
+CREATE TABLE IF NOT EXISTS traces(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL CHECK(kind in('ask','ask_stream','agent_chat','agent_confirm')),
+    session_id TEXT,
+    query TEXT,
+    status TEXT NOT NULL,          -- ok / refused / pending / error
+    latency_ms INTEGER NOT NULL,
+    steps INTEGER,                 -- Agent 工具步数，其他接口为 NULL
+    payload TEXT,                  -- JSON 摘要（命中、引用数、错误类型）
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_traces_created ON traces(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_traces_kind ON traces(kind, created_at DESC);

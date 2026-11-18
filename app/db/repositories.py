@@ -1,4 +1,5 @@
 import json
+import math
 import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -321,3 +322,80 @@ def set_pending_result(
             (status, json.dumps(result, ensure_ascii=False) if result is not None else None,
              pending_id),
         )
+
+
+# ==================== 观测：traces ====================
+# 原则：只存摘要（命中、引用数、错误类型），不存答案全文、不存 header/key。
+# trace 是诊断材料，不是备份；存全文会让表迅速膨胀，也扩大泄露面。
+
+TRACE_KINDS = ("ask", "ask_stream", "agent_chat", "agent_confirm")
+
+
+def create_trace(
+    conn: sqlite3.Connection,
+    *,
+    kind: str,
+    status: str,
+    latency_ms: int,
+    session_id: str | None = None,
+    query: str | None = None,
+    steps: int | None = None,
+    payload: dict | None = None,
+) -> int:
+    if kind not in TRACE_KINDS:
+        raise ValidationError(f"无效的 trace 类型：{kind}")
+    with conn:
+        cur = conn.execute(
+            """
+            INSERT INTO traces (kind, session_id, query, status, latency_ms, steps, payload, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (kind, session_id, query, status, latency_ms, steps,
+             json.dumps(payload, ensure_ascii=False) if payload else None,
+             _now_utc()),
+        )
+        return int(cur.lastrowid)
+
+
+def list_traces(conn: sqlite3.Connection, *, limit: int = 50,
+                kind: str | None = None) -> list[dict]:
+    sql = "SELECT * FROM traces"
+    params: list = []
+    if kind is not None:
+        sql += " WHERE kind=?"
+        params.append(kind)
+    sql += " ORDER BY id DESC LIMIT ?"
+    params.append(max(1, min(limit, 200)))
+    return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
+def get_trace(conn: sqlite3.Connection, trace_id: int) -> dict | None:
+    row = conn.execute("SELECT * FROM traces WHERE id=?", (trace_id,)).fetchone()
+    return dict(row) if row is not None else None
+
+
+def trace_stats(conn: sqlite3.Connection) -> dict:
+    """汇总指标。分位数在 Python 里算：SQLite 没有 percentile 函数，34 条数据也不值得上扩展。"""
+    rows = conn.execute("SELECT kind, status, latency_ms FROM traces").fetchall()
+    latencies = sorted(int(r["latency_ms"]) for r in rows)
+
+    def pct(p: float) -> int | None:
+        if not latencies:
+            return None
+        # 最近秩法：ceil(p/100 * n) - 1
+        idx = max(0, min(len(latencies) - 1, math.ceil(p / 100 * len(latencies)) - 1))
+        return latencies[idx]
+
+    by_kind: dict[str, int] = {}
+    by_status: dict[str, int] = {}
+    for r in rows:
+        by_kind[r["kind"]] = by_kind.get(r["kind"], 0) + 1
+        by_status[r["status"]] = by_status.get(r["status"], 0) + 1
+
+    return {
+        "count": len(rows),
+        "by_kind": by_kind,
+        "by_status": by_status,
+        "latency_p50_ms": pct(50),
+        "latency_p95_ms": pct(95),
+    }
