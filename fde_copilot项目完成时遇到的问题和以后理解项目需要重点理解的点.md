@@ -6731,3 +6731,107 @@ search 红字发票  -> ok=true, 4 hits, 片段长度 [103,71,64,78]
 **体积核对**：待跟踪部分约 500KB / 49 个文件；被忽略的是 `models/` 92MB、`data/chroma/` 1.5MB、`.ruff_cache/`。
 
 注：项目当前仍不是 git 仓库（`git status` 报 not a repository），尚未 `git init`。
+
+### 11.34 Git 首次提交（2026-11-18）
+
+用户自行完成，过程记录：
+
+1. `git log` 在家目录 `C:\Users\陈义` 执行 → `fatal: not a git repository`。原因：git 从**当前目录**向上找 `.git`，家目录不是仓库。cmd 跨盘切换必须 `cd /d D:\MyPython\fde_copilot`。
+2. 切到项目目录后仍报同样错误 → 说明还没 `git init`。
+3. `git init` → `git add -A`（出现 LF→CRLF warning，无害）→ `git ls-files models` 空输出（92MB 模型被 .gitignore 挡住）→ `git ls-files | find /c /v ""` = 55 个文件。
+4. 提交成功：`6df8d55 M0-M6: 完成 RAG 检索与 FastAPI 服务，M7 进行中`，`git status` 显示 working tree clean。
+
+**操作要点**
+- cmd 里数行数用 `find /c /v ""`（没有 `wc -l`）。
+- `git ls-files models` 空输出 = 忽略规则生效，这是提交大目录前最快的自检。
+- 提交失败（如身份未设）不会留半成品，暂存区仍在，改完直接重跑 commit。
+- 分支仍是 `master`（init.defaultBranch 未生效），要改：`git branch -M main`。
+- 建议 `git config --global core.quotepath false`，中文文件名不再显示成八进制转义。
+
+### 11.35 M7 任务 3~7 全部落地（2026-11-18）
+
+**新增/修改文件**
+| 文件 | 内容 |
+|---|---|
+| `app/db/schema.sql` | 新增 `pending_actions` 表 + `idx_pending_session` 索引 |
+| `app/db/repositories.py` | `create_pending` / `get_pending` / `count_pending` / `mark_pending_decided` / `set_pending_result` / `pending_expires_at`，`PENDING_TTL_SECONDS=1800` |
+| `app/agent/tools.py` | `CreateTicketArgs` / `UpdateTicketStatusArgs`、两个写工具、`WRITE_TOOLS`、`execute_read`/`execute_write` 共用 `_execute` |
+| `app/agent/loop.py` | 完整 Agent 循环（原有空文件 0 字节）：读工具执行、写工具落 pending、重复检测、max_steps |
+| `app/agent/confirm.py` | 确认状态机 + 幂等 + 超时 + 越权校验 |
+| `app/api/schemas.py` | `AgentStep` / `PendingOut` / `AgentChatRequest` / `AgentChatResponse` / `AgentConfirmRequest` / `AgentConfirmResponse` |
+| `app/api/main.py` | `POST /agent/chat`、`POST /agent/confirm` |
+
+**状态机设计**
+```text
+pending --approve--> confirmed --成功--> executed
+   |                    \------失败--> failed
+   |--reject--> rejected
+   \--超时----> expired
+```
+- **只有 pending 可执行**；executed 重复 approve 幂等返回首次 result；failed 不允许重试（否则"失败→重试→成功"产生两次副作用）；confirmed 中断/并发 → 409 保守处理。
+- **越权统一 404**：不存在与不属于该 session 返回同一响应，避免用状态码探测 id 存在性。
+- **先落 confirmed 再执行**：执行中途崩溃会停在 confirmed，重放被 409 挡住，而不是悄悄再执行一次。
+- **模型只能提议**：写工具在 loop 中只 `create_pending` 并返回，不调用 `execute_write`；写路径只有 `confirm_pending` 一条。
+
+**实测（临时库副本）**
+```text
+/agent/chat "订单 O001 收到时破了，帮我登记一张退款工单"
+  steps: get_order(executed) → search_knowledge(executed) → create_ticket(pending)
+  pending: PA-24647D1E，工单数 4 → 4（未落库）
+approve            -> 200 executed，工单数 4 → 5
+重复 approve       -> 200 executed，工单数仍 5（幂等）
+换 session confirm -> 404 not_found（消息"确认单 PA-xxx 不存在"）
+reject             -> 200 rejected，无新工单；重复 reject -> 200 rejected
+拒绝后 approve     -> 409 conflict
+超时(改 created_at) -> 409 conflict，状态置 expired
+C999 执行          -> 200 failed，error "客户 C999 不存在"
+confirmed 再 approve -> 409 conflict
+decision=foo / 空消息 -> 422
+事件 actor         -> [('created','api')]
+未知工具           -> 第1次 ok:false，第2次 repeat_abort
+同工具同参数       -> 第2次 repeat_abort
+```
+
+**验收**：M7.md 12 项全部打勾；LEARNING_PLAN M7 标为完成。
+
+**上线注意**：已有 `data/app.db` 需执行一次 `init_db`（重启 uvicorn 由 lifespan 自动执行，或 `python -m scripts.ticket_cli init-db`）才会建出 `pending_actions` 表。
+
+### 11.36 M8 完成：流式问答与 Streamlit 界面（2026-11-18）
+
+**交付物**
+| 文件 | 内容 |
+|---|---|
+| `app/llm/client.py` | `chat_stream()`：`stream=True` + SSE 逐行解析，`data: [DONE]` 结束 |
+| `app/api/main.py` | `POST /ask/stream`：`meta` → `delta*` → `done`/`error` |
+| `app/ui/streamlit_app.py` | 三标签页：知识问答（流式）、工单、Agent 确认 |
+| `README.md` | 从"M1 完成"的旧文案更新为当前状态、运行方式、接口表、设计要点、已知限制 |
+| `MILESTONES/M8.md` | 任务卡与自测题 |
+
+**SSE 设计的四个决定**
+1. 先发 `meta`（命中片段）再流文本：用户立刻知道在查什么。
+2. 一旦发出 200 就不能改状态码，模型错误只能发 `{"type":"error"}` 事件。
+3. 生成器惰性执行 → 路由里先 `load_settings()` 提前失败，避免"200 后流断"。
+4. `Cache-Control: no-cache` + `X-Accel-Buffering: no` 防代理缓冲。
+
+**Streamlit 的关键点**
+- 脚本每次交互从头重跑 → 历史/待确认单必须放 `st.session_state`。
+- `st.form` 打包输入，避免每改一个字段就重跑。
+- `st.chat_input` 只出现在页面底部；`st.text_input` 是普通字段，两者用途不同。
+- 前端只走 HTTP（`httpx`），不 import 业务模块 → 换前端/加鉴权不用动业务代码。
+
+**实测**
+```text
+/ask/stream 红字发票怎么开 → status 200，58 个 delta，done.citations 1 条，2.3s
+库外问题                   → 固定拒答话术，citations=[]
+streamlit headless 8502    → /_stcore/health = ok，首页 200
+AppTest 初次渲染           → 0 异常，3 tabs，工单表格 1 个，健康提示正常
+AppTest 提问               → qa_history 2 条，答案含 1 条引用、命中片段可见
+AppTest 注入 pending       → 警告 + JSON 参数 + 同意/拒绝按钮渲染正常
+```
+
+**顺手修的**
+- `use_container_width=True` 已弃用 → `width="stretch"`。
+- `api()` 的异常分支在非 Streamlit 运行时（直接 import）会因 `st.stop()` 不抛错而落到 `resp` 未定义 → 补 `raise ApiError`。
+- `README.md` 原文还停留在"M1 完成"，已更新。
+
+**已知限制**：Agent 未流式（工具调用与文本增量混流的复杂度留后）；无跨轮历史；单用户无鉴权；刷新丢前端历史但 pending 在库。

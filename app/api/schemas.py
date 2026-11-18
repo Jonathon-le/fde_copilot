@@ -105,3 +105,76 @@ class StatusUpdate(BaseModel):
     # note 给默认空串：状态变更必须留事件，但不该强制客户端想一句说明。
     # 空的时候由路由生成默认文案。
     note: str = Field(default="", max_length=200)
+
+
+# ==================== Agent 相关模型 ====================
+# 注意和 /ask 的区别：/ask 是"一问一答"，这里是"一问多步 + 可能需要确认"。
+
+class AgentStep(BaseModel):
+    """一步工具调用的记录。M9 的 trace 页面会直接消费这个结构。"""
+    step: int
+    tool: str
+    args: dict            # 工具参数原样返回，方便前端展示"模型想做什么"
+    ok: bool
+    elapsed_ms: int
+    action: str           # executed / pending / repeat_abort
+
+
+class PendingOut(BaseModel):
+    """等待用户确认的写操作。
+
+    故意包含 arguments：用户要能看懂"将创建什么"，而不是只看到一个 tool 名。
+    """
+    pending_id: str
+    tool: str
+    arguments: dict
+    expires_at: str       # ISO 时间；前端可以倒计时，服务端以 created_at 为准
+
+
+class AgentChatRequest(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={"examples": [{
+            "session_id": "3f2b8c1e-5a4d-4e6f-9a7b-2c1d0e9f8a7b",
+            "message": "订单 O001 收到时破了，帮我登记一下退款",
+        }]}
+    )
+    # session_id 由客户端生成（建议 UUID）：服务端不存会话内容，
+    # 但它用来绑定待确认操作——换一个 session 就确认不了别人的单。
+    session_id: str = Field(min_length=4, max_length=64, description="客户端生成的会话标识")
+    message: str = Field(min_length=1, max_length=500, description="用户这句话")
+
+    @field_validator("message")
+    @classmethod
+    def _message_not_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("消息不能为空")
+        return value
+
+
+class AgentChatResponse(BaseModel):
+    answer: str
+    steps: list[AgentStep] = Field(default_factory=list)
+    # pending 非空 = 有写操作在等确认，此时 answer 可能是上一轮的（通常为空）
+    pending: PendingOut | None = None
+
+
+class AgentConfirmRequest(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={"examples": [{
+            "pending_id": "PA-1A2B3C4D",
+            "session_id": "3f2b8c1e-5a4d-4e6f-9a7b-2c1d0e9f8a7b",
+            "decision": "approve",
+        }]}
+    )
+    pending_id: str = Field(min_length=1, max_length=32)
+    session_id: str = Field(min_length=4, max_length=64)
+    # Literal 而不是 str：传 "yes"/"ok" 这类词直接 422，
+    # 避免在业务代码里写 if decision in ("approve","yes","ok") 这种模糊判断。
+    decision: Literal["approve", "reject"]
+
+
+class AgentConfirmResponse(BaseModel):
+    pending_id: str
+    status: Literal["executed", "failed", "rejected"]
+    result: dict | None = None

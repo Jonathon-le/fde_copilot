@@ -33,6 +33,24 @@ class ListTicketsArgs(BaseModel) :
     customer_id :str|None=Field(default=None,description="按客户过滤，形如C001")
     status:TicketStatus|None=Field(default=None,description="按状态过滤")
 
+# ---------------- 写工具的参数模型 ----------------
+# 写工具的模型同样有两份用途：给模型看的 schema + 确认执行前的最后一道校验。
+# actor / status 这类服务端字段**不放进模型**，否则客户端/模型能伪造审计信息。
+
+Priority=Literal["low","normal","high","urgent"]
+
+class CreateTicketArgs(BaseModel) :
+    customer_id:str=Field(min_length=1,max_length=32,description="客户号，形如C001")
+    title:str=Field(min_length=1,max_length=200,description="工单标题，一句话概括问题")
+    description:str=Field(min_length=1,max_length=2000,description="问题详情")
+    order_id:str|None=Field(default=None,max_length=32,description="关联订单号，形如O001")
+    priority:Priority=Field(default="normal",description="优先级")
+
+class UpdateTicketStatusArgs(BaseModel) :
+    ticket_id:str=Field(min_length=1,max_length=32,description="工单号，形如TKT-1001")
+    status:TicketStatus=Field(description="目标状态")
+    note:str=Field(default="",max_length=200,description="变更说明，可留空")
+
 
 #统一的返回形状
 def _ok(**kwargs)->dict :
@@ -94,6 +112,33 @@ def _tool_list_tickets(conn,args:ListTicketsArgs)->dict :
         for t in tickets[:10]
     ])
 
+def _tool_create_ticket(conn,args:CreateTicketArgs)->dict :
+    """真正建单。只会被 confirm 流程调用，路由不能直接调它。"""
+    ticket=repo.create_ticket(
+        conn,
+        customer_id=args.customer_id,
+        title=args.title,
+        description=args.description,
+        order_id=args.order_id,
+        priority=args.priority,
+        actor="api",          # 审计字段由服务端写死
+    )
+    return _ok(ticket={
+        "id":ticket["id"],"customer_id":ticket["customer_id"],
+        "title":ticket["title"],"status":ticket["status"],
+        "priority":ticket["priority"],"created_at":ticket["created_at"],
+    })
+
+def _tool_update_ticket_status(conn,args:UpdateTicketStatusArgs)->dict :
+    """改状态。非法流转由仓库层抛 ConflictError，这里不用重复判断。"""
+    note=args.note or f"状态更新为 {args.status}"
+    ticket=repo.update_ticket_status(
+        conn,args.ticket_id,new_status=args.status,actor="api",note=note
+    )
+    return _ok(ticket={
+        "id":ticket["id"],"status":ticket["status"],"updated_at":ticket["updated_at"],
+    })
+
 #--------------------注册表--------------------------
 @dataclass(frozen=True)
 class ToolSpec :
@@ -138,7 +183,23 @@ READ_TOOLS :dict[str,ToolSpec]={
     ]
 }
 
-WRITE_TOOLS:dict[str,ToolSpec]={}
+WRITE_TOOLS:dict[str,ToolSpec]={
+    spec.name:spec for spec in[
+        ToolSpec(
+            name="create_ticket",
+            description=(
+                "创建客服工单。用户明确要求登记问题、报修、投诉，或需要跟进处理时使用。"
+                "创建前必须已确认客户号和问题描述；金额/退款等政策问题先用 search_knowledge。"
+            ),
+            args_model=CreateTicketArgs,func=_tool_create_ticket,write=True,
+        ),
+        ToolSpec(
+            name="update_ticket_status",
+            description="更新工单状态（解决、关闭、升级等）。用户要求关闭或推进自己的工单时使用。",
+            args_model=UpdateTicketStatusArgs,func=_tool_update_ticket_status,write=True,
+        ),
+    ]
+}
 
 def schema_for_model(tools:dict[str,ToolSpec]|None=None)->list[dict]:
     tools=READ_TOOLS if tools is None else tools
@@ -155,8 +216,13 @@ def schema_for_model(tools:dict[str,ToolSpec]|None=None)->list[dict]:
     ]
 #---------------唯一的读工具入口----------------
 
-def execute_read(name:str,arguments:dict,conn:sqlite3.Connection)->dict:
-    spec=READ_TOOLS.get(name)
+def _execute(registry:dict[str,ToolSpec],name:str,arguments:dict,conn:sqlite3.Connection)->dict:
+    """读/写工具共用的执行骨架：查表 → 校验参数 → 调函数 → 把业务异常变成 ok:false。
+
+    注意：它**不判断该不该执行**。写工具能不能跑，由 confirm 状态机保证；
+    任何像 excute_write 这样直接调用它的入口，都必须先过状态机。
+    """
+    spec=registry.get(name)
     if spec is None :
         return _fail("unknown_tool",f"工具{name!r}不存在或不可调用")
     try :
@@ -175,3 +241,13 @@ def execute_read(name:str,arguments:dict,conn:sqlite3.Connection)->dict:
         #意想不到的异常也不能让它把整个会话打崩:记日志，给模型一个可继续的失败结果
         logger.exception("tool %s failed",name)
         return _fail("internal_error","工具执行失败，请换一种方式再试")
+
+
+def execute_read(name:str,arguments:dict,conn:sqlite3.Connection)->dict:
+    """只读工具入口：loop 里可以直接调，没有副作用。"""
+    return _execute(READ_TOOLS,name,arguments,conn)
+
+
+def execute_write(name:str,arguments:dict,conn:sqlite3.Connection)->dict:
+    """写工具入口：**只允许 confirm 流程调用**，路由和 loop 都不能直接用它。"""
+    return _execute(WRITE_TOOLS,name,arguments,conn)

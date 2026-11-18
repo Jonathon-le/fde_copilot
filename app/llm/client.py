@@ -195,3 +195,77 @@ max_tokens:int|None=None,
     }
     
     
+
+def chat_stream(message:list[dict],*,tools:list[dict]|None=None,
+                temperature:float=0.2,max_tokens:int|None=None):
+    """流式调用模型，逐个 yield 文本片段。
+
+    为什么要单独一个函数而不是给 chat() 加参数：
+    返回类型从 dict 变成了生成器，调用方写法完全不同（for 循环消费），
+    硬塞进一个函数会让两种用法都变难读。
+
+    流式请求和普通请求的协议差异只有两处：
+    1. payload 里 stream=True；
+    2. 响应体不是一个大 JSON，而是一行行 "data: {...}"（SSE 格式），以 "data: [DONE]" 结束。
+
+    生成器是惰性执行的：函数体要等第一次 next() 才运行，所以参数错误、
+    网络错误都会在开始消费时才抛出。HTTP 层要先自己调 load_settings() 做快速失败。
+    """
+    settings=load_settings()
+    url=settings.llm_BASE_URL.strip().rstrip("/")+"/chat/completions"
+    headers={"Authorization":f"Bearer {(settings.llm_API_KEY).strip()}",
+             "Content-Type":"application/json"}
+    max_tok=max_tokens if max_tokens is not None else settings.llm_max_tokens
+    payload={
+        "model":settings.llm_MODEL,
+        "messages":message,
+        "temperature":temperature,
+        "max_tokens":max_tok,
+        "stream":True,
+    }
+    if tools is not None:
+        payload["tools"]=tools
+        payload["tool_choice"]="auto"
+
+    try:
+        with httpx.Client(timeout=httpx.Timeout(settings.llm_timeout,connect=10.0)) as client:
+            # client.stream 是上下文管理器：不 with 的话连接不会关，
+            # 长时间流式会把连接池占满。
+            with client.stream("POST",url,headers=headers,json=payload) as response:
+                if not 200<=response.status_code<300:
+                    body=response.read().decode("utf-8","ignore")[:300]
+                    raise LLMRequestError(
+                        f"模型服务返回错误：{body}",status_code=response.status_code
+                    )
+                for line in response.iter_lines():
+                    if not line:
+                        continue
+                    line=line.strip()
+                    # SSE 里还有 event:/id:/comment 行，只处理 data:
+                    if not line.startswith("data:"):
+                        continue
+                    data=line[len("data:"):].strip()
+                    if data=="[DONE]":
+                        return
+                    try:
+                        chunk=json.loads(data)
+                    except ValueError as exc:
+                        raise LLMResponseError(
+                            f"流式响应不是合法JSON:{data[:200]!r}"
+                        ) from exc
+                    if isinstance(chunk,dict) and "error" in chunk:
+                        raise LLMResponseError(f"服务端返回错误：{str(chunk['error'])[:300]}")
+                    choices=chunk.get("choices") if isinstance(chunk,dict) else None
+                    if not choices:
+                        continue
+                    delta=choices[0].get("delta") or {}
+                    piece=delta.get("content")
+                    # 推理模型的 reasoning_content 不推给用户，只取正式内容
+                    if isinstance(piece,str) and piece:
+                        yield piece
+    except httpx.TimeoutException as exc:
+        raise LLMRequestError("请求超时") from exc
+    except httpx.ConnectError as exc:
+        raise LLMRequestError("无法连接大模型服务") from exc
+    except httpx.RequestError as exc :
+        raise LLMRequestError(f"请求失败:{exc}") from exc

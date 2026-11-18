@@ -1,6 +1,7 @@
+import json
 import secrets
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 TICKET_STATUSES = {"open", "in_progress", "resolved", "closed", "escalated"}
 TICKET_PRIORITIES = {"low", "normal", "high", "urgent"}
@@ -230,3 +231,93 @@ def update_ticket_status(
         if row is None:
             raise RuntimeError(f"工单 {ticket_id} 更新后查询失败")
         return dict(row)
+
+
+# ==================== 待确认操作（pending_actions） ====================
+# 状态机：
+#   pending --approve--> confirmed --成功--> executed
+#      |                     \------失败--> failed
+#      |--reject--> rejected
+#      \--超时----> expired
+# 只有 pending 能被确认；其余状态再确认要么幂等返回，要么 409。
+
+PENDING_TTL_SECONDS = 30 * 60   # 确认单有效期：30 分钟
+
+
+def pending_expires_at(created_at: str) -> str:
+    """由 created_at 算出到期时间。不单独存列：TTL 以后要调，存了就得多写一次迁移。"""
+    created = datetime.fromisoformat(created_at)
+    return (created + timedelta(seconds=PENDING_TTL_SECONDS)).isoformat()
+
+
+def create_pending(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    tool_name: str,
+    arguments: dict,
+) -> dict:
+    """把一次写操作提议存成待确认记录，返回整行。"""
+    pending_id = f"PA-{secrets.token_hex(4).upper()}"
+    now = _now_utc()
+    with conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO pending_actions
+                (id, session_id, tool_name, arguments, status, created_at)
+            VALUES (?, ?, ?, ?, 'pending', ?)
+            """,
+            (pending_id, session_id, tool_name,
+             json.dumps(arguments, ensure_ascii=False), now),
+        )
+        row = cur.execute(
+            "SELECT * FROM pending_actions WHERE id=?", (pending_id,)
+        ).fetchone()
+    if row is None:
+        raise RuntimeError(f"待确认操作 {pending_id} 创建后查询失败")
+    return dict(row)
+
+
+def get_pending(conn: sqlite3.Connection, pending_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM pending_actions WHERE id=?", (pending_id,)
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def count_pending(conn: sqlite3.Connection, session_id: str) -> int:
+    """该会话里还没处理的待办数量，用于限流（防止模型刷单）。"""
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM pending_actions WHERE session_id=? AND status='pending'",
+        (session_id,),
+    ).fetchone()
+    return int(row["n"])
+
+
+def mark_pending_decided(conn: sqlite3.Connection, pending_id: str, status: str) -> None:
+    """记录用户的决定：confirmed / rejected / expired。"""
+    if status not in ("confirmed", "rejected", "expired"):
+        raise ValidationError(f"无效的待确认状态：{status}")
+    with conn:
+        conn.execute(
+            "UPDATE pending_actions SET status=?, decided_at=? WHERE id=?",
+            (status, _now_utc(), pending_id),
+        )
+
+
+def set_pending_result(
+    conn: sqlite3.Connection,
+    pending_id: str,
+    status: str,
+    result: dict | None,
+) -> None:
+    """记录执行结果：executed / failed。result 存 JSON，幂等重放时原样返回。"""
+    if status not in ("executed", "failed"):
+        raise ValidationError(f"无效的执行结果状态：{status}")
+    with conn:
+        conn.execute(
+            "UPDATE pending_actions SET status=?, result=? WHERE id=?",
+            (status, json.dumps(result, ensure_ascii=False) if result is not None else None,
+             pending_id),
+        )
