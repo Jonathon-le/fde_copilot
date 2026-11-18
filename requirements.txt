@@ -1,0 +1,9 @@
+fastapi
+openai
+chromadb
+sentence-transformers
+streamlit
+jieba
+rank-bm25
+pypdf
+httpx

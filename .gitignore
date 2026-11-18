@@ -1,0 +1,42 @@
+# Python 生成的字节码
+__pycache__/
+*.py[cod]
+
+# 虚拟环境
+.venv/
+venv/
+
+# 环境变量和密钥
+.env
+.env.*
+!.env.example
+
+# 本地运行时数据（app.db 用 WAL 模式，会额外产生 -wal / -shm）
+data/app.db
+data/app.db-*
+data/chroma/
+
+# IDE
+.idea/
+.vscode/
+
+# 测试和缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 日志
+*.log
+
+# 本地模型（约 92MB，可由 scripts 重新下载）
+models/
+
+# 生成的中间产物
+chunks.jsonl
+out.txt
+*.tmp
+*.bak
+
+# 任意位置备份的 Excel（防止误提交）
+~$*.xlsx
+*_备份_*.xlsx

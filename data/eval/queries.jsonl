@@ -1,0 +1,14 @@
+{"id":"q01","query":"红字发票怎么开","category":"term","expect":[{"doc":"发票与报销","section":"4. 红字发票（退票 / 红冲）"}],"note":"行业术语，jieba 切成 红/字/发票"}
+{"id":"q02","query":"增值税专用发票需要什么条件","category":"term","expect":[{"doc":"发票与报销","section":"1. 发票类型"}],"note":"术语+资质"}
+{"id":"q03","query":"免邮门槛是多少","category":"term","expect":[{"doc":"配送与物流","section":"6. 运费规则"}],"note":"规则型术语"}
+{"id":"q04","query":"积分多久清零","category":"term","expect":[{"doc":"会员与积分","section":"4. 积分有效期"}],"note":"精确数值条款"}
+{"id":"q05","query":"买回来不想要了能退吗","category":"paraphrase","expect":[{"doc":"退款政策","section":"2. 无理由退换货规则"}],"note":"与原文措辞完全不重叠"}
+{"id":"q06","query":"钱什么时候退回我卡里","category":"paraphrase","expect":[{"doc":"退款政策","section":"5. 退款时效与路径"}],"note":"口语，无「退款时效」字面"}
+{"id":"q07","query":"快递好几天没动了","category":"paraphrase","expect":[{"doc":"配送与物流","section":"5. 配送异常处理"}],"note":"物流停滞的口语说法"}
+{"id":"q08","query":"发票丢了还能再给一份吗","category":"paraphrase","expect":[{"doc":"发票与报销","section":"6. 其他说明"}],"note":"原文是「发票丢失…可提供复印件」"}
+{"id":"q09","query":"退款以后积分和优惠券怎么处理","category":"multi_doc","expect":[{"doc":"退款政策","section":"5. 退款时效与路径"},{"doc":"会员与积分","section":"2. 积分获取"}],"note":"主答案退款政策 5.3，积分回冲在会员 2.3"}
+{"id":"q10","query":"退款了已经开的发票怎么办","category":"multi_doc","expect":[{"doc":"发票与报销","section":"4. 红字发票（退票 / 红冲）"},{"doc":"退款政策","section":"5. 退款时效与路径"}],"note":"红冲规则在发票 4"}
+{"id":"q11","query":"收到的货是坏的该找谁","category":"multi_doc","expect":[{"doc":"配送与物流","section":"4. 收货与验货"},{"doc":"售后服务与常见问题","section":"2. 常见问题处理"}],"note":"当场拒收 vs 24小时内申请"}
+{"id":"q12","query":"可以货到付款吗","category":"absent","expect":[],"note":"库里没有支付方式"}
+{"id":"q13","query":"能开英文发票吗","category":"absent","expect":[],"note":"库外"}
+{"id":"q14","query":"有学生优惠吗","category":"absent","expect":[],"note":"库外"}
