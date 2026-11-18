@@ -6884,3 +6884,33 @@ RELEVANCE_MIN_SCORE=0.99 /ask→ 200 "资料中没有提到这个问题。"，0.
 pytest -q                    → 8 passed（tokenize 幂等、rrf 去重、closed→open 拒绝、pending 幂等、越权 404、/ask 422、citations+trace、trace 接口）
 Streamlit AppTest            → 4 tabs，4 个 metric，2 个 dataframe，0 异常
 ```
+
+### 11.39 M10 完成：文档与作品化（2026-11-18）
+
+**新增**
+| 文件 | 内容 |
+|---|---|
+| `MILESTONES/M10.md` | 任务卡 + 验收 + 5 道自测题 |
+| `docs/architecture.md` | Mermaid 分层图、RAG 与 Agent 两条时序图、模块职责表、10 条"决策 + 代价"、数据模型、错误映射 |
+| `docs/demo.md` | 5 分钟演示，每步标注 💰花钱/💤不花钱，附"常被问到的问题" |
+| `docs/fde-mapping.md` | 7 项能力 → 具体文件/数据证据 + "哪里做得不够"优先级回答 |
+| `scripts/demo_walkthrough.py` | 对运行中的 API 跑健康检查 → /ask → /agent/chat →（有 pending 则 reject 幂等）→ traces/metrics |
+
+**README 重写**：3 行讲清定位 → 架构图 → 快速开始 → 11 个接口表 → 关键设计（决策/为什么/代价）→ 诚实评测表 → 测试脚本 → 目录 → 5 条限制 → 延伸材料。
+
+**实测**
+```text
+python -m scripts.demo_walkthrough --base-url http://127.0.0.1:8001
+  [OK] 健康检查 db=ok index=34
+  [OK] POST /ask 200 · 2.1s · citations=1
+  [OK] POST /agent/chat 200 · 2.6s · steps=[('get_order','executed')]
+  [OK] GET /metrics/summary count=7 p50=1662ms p95=3532ms
+  [OK] GET /traces 5 条
+  退出码 0
+pytest -q → 8 passed
+```
+顺手把 `agent_chat` 的 trace payload 加上工具名列表，排查时能直接看出模型走了哪条路径。
+
+**核对过的数字**：接口 11 个路径（`/tickets` 同时有 GET/POST）；表 6 张（customers/orders/tickets/ticket_events/pending_actions/traces）；评测数字与 `data/eval/report.md` 一致。
+
+**密钥扫描**：仅命中示例占位（`sk-test-dummy`、`sk-错误的`、`"..."`），无真实 key。

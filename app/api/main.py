@@ -237,7 +237,10 @@ def agent_chat(
     payload: dict = {}
     try:
         result = run_agent(conn, session_id=req.session_id, message=req.message)
-        step_count = len(result.get("steps") or [])
+        steps = result.get("steps") or []
+        step_count = len(steps)
+        # 工具名列表进 payload：排查时一眼看出模型走了哪条路径
+        payload["tools"] = [s["tool"] for s in steps]
         if result.get("pending"):
             status = "pending"
             payload["pending_tool"] = result["pending"]["tool"]
@@ -405,7 +408,10 @@ def agent_chat(
     payload: dict = {}
     try:
         result = run_agent(conn, session_id=req.session_id, message=req.message)
-        step_count = len(result.get("steps") or [])
+        steps = result.get("steps") or []
+        step_count = len(steps)
+        # 工具名列表进 payload：排查时一眼看出模型走了哪条路径
+        payload["tools"] = [s["tool"] for s in steps]
         if result.get("pending"):
             status = "pending"
             payload["pending_tool"] = result["pending"]["tool"]
