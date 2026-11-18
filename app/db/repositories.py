@@ -399,3 +399,34 @@ def trace_stats(conn: sqlite3.Connection) -> dict:
         "latency_p50_ms": pct(50),
         "latency_p95_ms": pct(95),
     }
+
+
+# ==================== Agent 会话历史 ====================
+# 只存 user/assistant 的自然语言内容。tool_calls 与工具结果不入库：
+# 它们只在"当轮循环"内有意义，回放旧工具结果既占空间，也可能误导模型。
+
+def add_agent_message(conn: sqlite3.Connection, *, session_id: str,
+                      role: str, content: str) -> None:
+    if role not in ("user", "assistant"):
+        raise ValidationError(f"无效的消息角色：{role}")
+    with conn:
+        conn.execute(
+            "INSERT INTO agent_messages (session_id, role, content, created_at) VALUES (?,?,?,?)",
+            (session_id, role, content, _now_utc()),
+        )
+
+
+def list_agent_messages(conn: sqlite3.Connection, session_id: str,
+                        *, limit: int = 20) -> list[dict]:
+    """取最近 limit 条，按时间正序返回（喂给模型时顺序必须是旧的在前）。"""
+    rows = conn.execute(
+        "SELECT role, content FROM agent_messages WHERE session_id=? ORDER BY id DESC LIMIT ?",
+        (session_id, max(1, min(limit, 100))),
+    ).fetchall()
+    return [dict(r) for r in reversed(rows)]
+
+
+def clear_agent_messages(conn: sqlite3.Connection, session_id: str) -> int:
+    with conn:
+        cur = conn.execute("DELETE FROM agent_messages WHERE session_id=?", (session_id,))
+        return cur.rowcount

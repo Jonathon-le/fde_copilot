@@ -120,6 +120,42 @@ def load_settings() :
         raise LLMConfigError (f"配置读取失败：{exc}")from exc
     validate_settings(settings)
     return settings
+def _validate_completion(data:dict)->dict:
+    """校验一次非流式补全响应，同步/异步客户端共用。
+
+    抽出来的原因：协议校验最容易被复制成两份，然后一边改了另一边没改。
+    """
+    #响应体是json但顶层不是对象
+    if not isinstance(data,dict) :
+        raise LLMResponseError(
+            f"响应顶层应为JSON对象，实际是{type(data).__name__}"
+        )
+    #200但响应里带error字段
+    if "error" in data :
+        raise LLMResponseError(f"服务端返回错误：{str(data['error'])[:300]}")
+    choices=data.get("choices")
+    #choices缺失或choices为空
+    if not isinstance(choices,list) or not choices :
+        raise LLMResponseError(f"响应缺少choices或choices为空:{str(data)[:300]}")
+    first=choices[0]
+    message_=first.get("message") if isinstance(first,dict) else None
+    if not isinstance(message_,dict):
+        raise LLMResponseError("choices[0]缺少message对象")
+    content=message_.get("content") or ""
+    tool_calls=_parse_tool_calls(message_)
+    #content+tool_calls为空
+    if not content.strip() and not tool_calls :
+        raise LLMResponseError(
+            f"响应里既没有content也没有tool_calls:{str(data)[:300]}"
+            )
+    return{
+        "content":content,
+        "tool_calls":tool_calls,
+        "model":data.get("model"),
+        "usage":data.get("usage")
+    }
+
+
 def chat (message:list[dict[str,str]],
 *,
 tools:list[dict]|None=None,
@@ -160,39 +196,7 @@ max_tokens:int|None=None,
         raise LLMResponseError(
             f"响应不是合法Json:{response.text[:300]!r}"
             ) from exc
-    #响应体是json但顶层不是对象
-    if not isinstance(data,dict) :
-        raise LLMResponseError(
-            f"响应顶层应为JSON对象，实际是{type(data).__name__}"
-        )
-    #200但响应里带error字段
-    if "error" in data :
-        raise LLMResponseError(f"服务端返回错误：{str(data['error'])[:300]}"
-                               )
-    choices=data.get("choices")
-    #choices缺失或choices为空
-    if not isinstance(choices,list) or not choices :
-        raise LLMResponseError(
-            f"响应缺少choices或choices为空:{str(data)[:300]}"
-        )
-    first=choices[0]
-    message_=first.get("message") if isinstance(first,dict) else None
-    #choices[0]不是对象，message缺失1或不是对象
-    if not isinstance(message_,dict):
-        raise LLMResponseError("choices[0]缺少message对象")
-    content=message_.get("content") or ""
-    tool_calls=_parse_tool_calls(message_)
-    #content+tool_calls为空
-    if not  content.strip() and not tool_calls :
-        raise LLMResponseError(
-            f"响应里既没有content也没有tool_calls:{str(data)[:300]}"
-            )
-    return{
-        "content":content,
-        "tool_calls":tool_calls,
-        "model":data.get("model"),
-        "usage":data.get("usage")
-    }
+    return _validate_completion(data)
     
     
 
@@ -268,4 +272,111 @@ def chat_stream(message:list[dict],*,tools:list[dict]|None=None,
     except httpx.ConnectError as exc:
         raise LLMRequestError("无法连接大模型服务") from exc
     except httpx.RequestError as exc :
+        raise LLMRequestError(f"请求失败:{exc}") from exc
+
+
+# ==================== 异步客户端（M8 之后的并发优化） ====================
+# 为什么需要：同步路由靠线程池（默认约 40）撑并发，等模型时线程被占着，
+# 线程一满新请求就排队。异步客户端在等待网络时把控制权还给事件循环，
+# 同一个进程可以同时撑着几百个"等待中"的请求。
+#
+# 注意：异步只对 **IO 等待** 有效。search_hybrid/jieba/BM25 是 CPU 计算，
+# 在异步路由里必须丢进线程池（fastapi.concurrency.run_in_threadpool），
+# 否则会阻塞事件循环——那就退化得比同步还差。
+
+def _build_payload(settings, message, *, tools, temperature, max_tokens, stream: bool) -> dict:
+    max_tok = max_tokens if max_tokens is not None else settings.llm_max_tokens
+    payload = {
+        "model": settings.llm_MODEL,
+        "messages": message,
+        "temperature": temperature,
+        "max_tokens": max_tok,
+        "stream": stream,
+    }
+    if tools is not None:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+    return payload
+
+
+async def achat(message:list[dict],*,tools:list[dict]|None=None,
+                temperature:float=0.2,max_tokens:int|None=None)->dict:
+    """chat() 的异步版本，返回结构完全一致。"""
+    settings=load_settings()
+    url=settings.llm_BASE_URL.strip().rstrip("/")+"/chat/completions"
+    headers={"Authorization":f"Bearer {(settings.llm_API_KEY).strip()}",
+             "Content-Type":"application/json"}
+    payload=_build_payload(settings,message,tools=tools,
+                           temperature=temperature,max_tokens=max_tokens,stream=False)
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(settings.llm_timeout,connect=10.0)
+        ) as client:
+            response=await client.post(url,headers=headers,json=payload)
+    except httpx.TimeoutException as exc:
+        raise LLMRequestError("请求超时") from exc
+    except httpx.ConnectError as exc:
+        raise LLMRequestError("无法连接大模型服务") from exc
+    except httpx.RequestError as exc:
+        raise LLMRequestError(f"请求失败:{exc}") from exc
+
+    if not 200<=response.status_code<300:
+        raise LLMRequestError(f"模型服务返回错误：{response.text[:300]}",
+                              status_code=response.status_code)
+    try:
+        data=response.json()
+    except ValueError as exc:
+        raise LLMResponseError(f"响应不是合法Json:{response.text[:300]!r}") from exc
+    return _validate_completion(data)
+
+
+async def achat_stream(message:list[dict],*,tools:list[dict]|None=None,
+                       temperature:float=0.2,max_tokens:int|None=None):
+    """chat_stream() 的异步版本。
+
+    异步生成器：用 async for 消费，例如
+        async for piece in achat_stream(messages):
+            ...
+    """
+    settings=load_settings()
+    url=settings.llm_BASE_URL.strip().rstrip("/")+"/chat/completions"
+    headers={"Authorization":f"Bearer {(settings.llm_API_KEY).strip()}",
+             "Content-Type":"application/json"}
+    payload=_build_payload(settings,message,tools=tools,
+                           temperature=temperature,max_tokens=max_tokens,stream=True)
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(settings.llm_timeout,connect=10.0)
+        ) as client:
+            async with client.stream("POST",url,headers=headers,json=payload) as response:
+                if not 200<=response.status_code<300:
+                    body=(await response.aread()).decode("utf-8","ignore")[:300]
+                    raise LLMRequestError(f"模型服务返回错误：{body}",
+                                          status_code=response.status_code)
+                async for line in response.aiter_lines():
+                    if not line:
+                        continue
+                    line=line.strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data=line[len("data:"):].strip()
+                    if data=="[DONE]":
+                        return
+                    try:
+                        chunk=json.loads(data)
+                    except ValueError as exc:
+                        raise LLMResponseError(f"流式响应不是合法JSON:{data[:200]!r}") from exc
+                    if isinstance(chunk,dict) and "error" in chunk:
+                        raise LLMResponseError(f"服务端返回错误：{str(chunk['error'])[:300]}")
+                    choices=chunk.get("choices") if isinstance(chunk,dict) else None
+                    if not choices:
+                        continue
+                    piece=(choices[0].get("delta") or {}).get("content")
+                    if isinstance(piece,str) and piece:
+                        yield piece
+    except httpx.TimeoutException as exc:
+        raise LLMRequestError("请求超时") from exc
+    except httpx.ConnectError as exc:
+        raise LLMRequestError("无法连接大模型服务") from exc
+    except httpx.RequestError as exc:
         raise LLMRequestError(f"请求失败:{exc}") from exc

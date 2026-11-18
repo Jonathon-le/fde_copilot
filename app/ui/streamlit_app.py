@@ -366,6 +366,11 @@ with tab_agent:
             st.rerun()
 
     if st.button("清空 Agent 对话", key="clear_agent"):
+        # 同时清服务端历史：否则下一轮模型还会记得"已经清掉"的对话
+        try:
+            api("POST", "/agent/reset", json={"session_id": st.session_state.agent_session})
+        except ApiError as exc:
+            st.warning(f"服务端历史清理失败（{exc.status}）：{exc}")
         st.session_state.agent_history = []
         st.session_state.agent_pending = None
         st.rerun()

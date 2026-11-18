@@ -42,6 +42,18 @@ def _out(row: dict, status: str, result: dict | None = None) -> dict:
     return {"pending_id": row["id"], "status": status, "result": result}
 
 
+def _note(conn: sqlite3.Connection, row: dict, text: str) -> None:
+    """把确认结果写进 Agent 会话历史，供下一轮对话使用。
+
+    只在状态真正发生变化时调用（幂等重放不写），否则历史会被重复条目刷满。
+    """
+    try:
+        repo.add_agent_message(conn, session_id=row["session_id"],
+                               role="assistant", content=text)
+    except Exception:
+        logger.exception("save confirm history failed")
+
+
 def confirm_pending(
     conn: sqlite3.Connection,
     *,
@@ -74,6 +86,7 @@ def confirm_pending(
             repo.mark_pending_decided(conn, pending_id, "expired")
             raise repo.ConflictError("确认单已超时，请重新发起")
         repo.mark_pending_decided(conn, pending_id, "rejected")
+        _note(conn, row, f"用户拒绝了待确认操作 {row['tool_name']}（{row['id']}），未执行任何写操作。")
         return _out(row, "rejected")
 
     # ---------------- 同意 ----------------
@@ -119,8 +132,16 @@ def confirm_pending(
         logger.exception("confirm execute failed: %s", tool_name)
         repo.set_pending_result(conn, pending_id, "failed",
                                 {"ok": False, "error": "执行失败，请联系管理员"})
+        _note(conn, row, f"待确认操作 {row['tool_name']}（{row['id']}）执行失败。")
         return _out(row, "failed", {"ok": False, "error": "执行失败，请联系管理员"})
 
     final_status = "executed" if result.get("ok") else "failed"
     repo.set_pending_result(conn, pending_id, final_status, result)
+    if final_status == "executed":
+        ticket = (result or {}).get("ticket") or {}
+        detail = f"，工单 {ticket['id']}" if ticket.get("id") else ""
+        _note(conn, row, f"待确认操作 {row['tool_name']}（{row['id']}）已执行成功{detail}。")
+    else:
+        _note(conn, row, f"待确认操作 {row['tool_name']}（{row['id']}）执行失败："
+                         f"{(result or {}).get('error', '未知原因')}")
     return _out(row, final_status, result)

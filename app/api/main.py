@@ -6,19 +6,20 @@ from contextlib import asynccontextmanager
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Path, Query, Response
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 
 from app.api.errors import register_error_handlers
 from app.agent.confirm import confirm_pending
 from app.agent.loop import run_agent
 from app.api.schemas import (
-    AgentChatRequest, AgentChatResponse, AgentConfirmRequest, AgentConfirmResponse,
+    AgentChatRequest, AgentChatResponse, AgentConfirmRequest, AgentConfirmResponse, AgentResetRequest,
     AskRequest, AskResponse, Citation, HitOut,
     TicketCreate, TicketDetail, TicketOut, StatusUpdate, TicketStatus,
 )
 from app.config import get_settings
 from app.db.connection import get_connection, init_db
-from app.llm.client import LLMError, chat, chat_stream, load_settings
+from app.llm.client import LLMError, achat_stream, chat, chat_stream, load_settings
 from app.obs.trace import record_trace, record_trace_detached
 from app.rag.relevance import is_relevant
 from app.rag.hybrid import search_hybrid
@@ -209,6 +210,178 @@ def update_ticket_status_api(
     # errors.py 里单独注册了它，所以不会被 ValidationError 的 400 抢走）
     return repo.update_ticket_status(
         conn, ticket_id, new_status=req.status, actor="api", note=note
+    )
+
+
+# ==================== Agent 接口 ====================
+# 和 /ask 的区别：/ask 是固定流水线（检索→作答）；
+# 这里是模型自己决定调什么工具，而且写操作要经过 /agent/confirm 二次确认。
+
+@app.post(
+    "/agent/chat",
+    response_model=AgentChatResponse,
+    summary="客服 Agent 对话",
+    description=(
+        "让模型决定调用哪些工具（查订单、查工单、检索知识库）。"
+        "如果它提议创建工单或改状态，不会立刻执行，而是返回 pending 等待 /agent/confirm。"
+        "**注意：这个接口会多轮调用模型，耗时可能到数秒，客户端超时建议 60s 以上。**"
+    ),
+)
+def agent_chat(
+    req: AgentChatRequest,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict:
+    # 路由只做三件事：接参数、调编排、返回。检索/工具/循环都在 agent 层。
+    started = time.perf_counter()
+    status = "ok"
+    step_count: int | None = None
+    payload: dict = {}
+    try:
+        result = run_agent(conn, session_id=req.session_id, message=req.message)
+        steps = result.get("steps") or []
+        step_count = len(steps)
+        # 工具名列表进 payload：排查时一眼看出模型走了哪条路径
+        payload["tools"] = [s["tool"] for s in steps]
+        if result.get("pending"):
+            status = "pending"
+            payload["pending_tool"] = result["pending"]["tool"]
+        return result
+    except Exception as exc:
+        status = "error"
+        payload["error"] = type(exc).__name__
+        raise
+    finally:
+        record_trace(conn, kind="agent_chat", status=status,
+                     latency_ms=int((time.perf_counter() - started) * 1000),
+                     session_id=req.session_id, query=req.message,
+                     steps=step_count, payload=payload or None)
+
+
+@app.post(
+    "/agent/confirm",
+    response_model=AgentConfirmResponse,
+    summary="确认或拒绝待执行操作",
+    description=(
+        "对 /agent/chat 返回的 pending_id 做 approve / reject。"
+        "重复 approve 同一 pending_id 是幂等的：返回第一次的结果，不会重复建单。"
+        "确认单超过 30 分钟返回 409；session_id 不匹配返回 404。"
+    ),
+)
+def agent_confirm(
+    req: AgentConfirmRequest,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict:
+    # 领域异常（NotFoundError/ConflictError）交给 errors.py 统一翻译成 404/409，
+    # 这里不写 try/except——和 M6 的约定一致。
+    started = time.perf_counter()
+    status = "ok"
+    payload: dict = {"decision": req.decision}
+    try:
+        result = confirm_pending(
+            conn,
+            pending_id=req.pending_id,
+            session_id=req.session_id,
+            decision=req.decision,
+        )
+        status = result.get("status", "ok")
+        return result
+    except Exception as exc:
+        status = "error"
+        payload["error"] = type(exc).__name__
+        raise
+    finally:
+        record_trace(conn, kind="agent_confirm", status=status,
+                     latency_ms=int((time.perf_counter() - started) * 1000),
+                     session_id=req.session_id, payload=payload)
+
+
+# ==================== 流式问答（M8） ====================
+# 为什么单独一个接口而不是给 /ask 加 ?stream=true：
+# 返回类型从 JSON 变成 SSE 流，客户端解析方式完全不同，混在一起两边都难写。
+
+def _sse(payload: dict) -> str:
+    """把 dict 编码成一条 SSE 事件。
+
+    SSE 格式很简单：`data: <一行文本>\n\n`，空行表示事件结束。
+    我们只在 data 里放一个 JSON，前端统一 json.loads 即可，
+    不需要用 event: 字段区分类型（type 字段在 JSON 里）。
+    """
+    return "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+
+
+@app.post(
+    "/ask/stream",
+    summary="流式知识库问答",
+    description=(
+        "与 `/ask` 逻辑相同，但用 SSE 逐字返回。事件类型："
+        "`meta`（命中片段）→ 若干 `delta`（文本片段）→ `done`（引用）或 `error`。"
+        "客户端按行读取，遇到空行结束一条事件。"
+    ),
+)
+async def ask_stream(req: AskRequest) -> StreamingResponse:
+    # 配置校验是纯内存操作，放在事件循环里没问题，而且必须"提前失败"。
+    load_settings()
+
+    # 检索是 CPU 密集（jieba/BM25/向量打分）：必须丢线程池。
+    # 直接在 async 路由里同步调用，会把整个事件循环卡住——比同步路由更糟。
+    relevant, top_score = await run_in_threadpool(is_relevant, req.question)
+    try:
+        hits = await run_in_threadpool(
+            search_hybrid, req.question, top_k=req.top_k, mode=req.mode
+        )
+    except IndexEmptyError as exc:          # 此时还没发响应头，可以正常变 503
+        raise HTTPException(status_code=503, detail="向量库为空，请先构建索引") from exc
+
+    hit_meta = [
+        {"n": i, "doc_id": h["doc_id"],
+         "section": h["section"].lstrip("#").strip(), "score": round(h["score"], 6)}
+        for i, h in enumerate(hits, start=1)
+    ]
+
+    async def event_stream():
+        started = time.perf_counter()
+        status = "ok"
+        payload: dict = {"hits": len(hits)}
+        if top_score:
+            payload["gate"] = {"top_score": round(top_score, 4)}
+        try:
+            yield _sse({"type": "meta", "hits": hit_meta})
+
+            if not relevant or not hits:
+                status = "refused"
+                yield _sse({"type": "delta", "text": NO_CONTEXT_ANSWER})
+                yield _sse({"type": "done", "citations": []})
+                return
+
+            parts: list[str] = []
+            try:
+                # async for：等待模型输出时不占用线程，事件循环可以去处理别的请求
+                async for piece in achat_stream(build_messages(req.question, hits)):
+                    parts.append(piece)
+                    yield _sse({"type": "delta", "text": piece})
+            except LLMError:
+                status = "error"
+                yield _sse({"type": "error", "message": "模型服务暂时不可用，请稍后重试"})
+                return
+
+            content = "".join(parts)
+            citations = _extract_citations(content, hits)
+            payload["citations"] = len(citations)
+            yield _sse({"type": "done", "citations": [c.model_dump() for c in citations]})
+        finally:
+            # 写库是同步 IO，同样丢线程池；且流式响应在路由返回后才结束，
+            # 请求级连接已关闭，必须用独立连接。
+            await run_in_threadpool(
+                record_trace_detached,
+                kind="ask_stream", status=status,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                query=req.question, payload=payload,
+            )
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
@@ -571,3 +744,16 @@ def get_trace_api(
 )
 def metrics_summary(conn: sqlite3.Connection = Depends(get_db)) -> dict:
     return repo.trace_stats(conn)
+
+
+@app.post(
+    "/agent/reset",
+    summary="清空会话历史",
+    description="删除该 session_id 下的 Agent 对话记录，返回删除条数。待确认单不受影响。",
+)
+def agent_reset(
+    req: AgentResetRequest,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict:
+    deleted = repo.clear_agent_messages(conn, req.session_id)
+    return {"session_id": req.session_id, "deleted": deleted}

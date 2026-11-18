@@ -6914,3 +6914,62 @@ pytest -q → 8 passed
 **核对过的数字**：接口 11 个路径（`/tickets` 同时有 GET/POST）；表 6 张（customers/orders/tickets/ticket_events/pending_actions/traces）；评测数字与 `data/eval/report.md` 一致。
 
 **密钥扫描**：仅命中示例占位（`sk-test-dummy`、`sk-错误的`、`"..."`），无真实 key。
+
+### 11.40 项目里程碑全部完成（2026-11-18）
+
+**M0–M10 全部完成并验收**，git 提交链：
+
+```text
+d44c0c5 M10: README 重写、架构/演示/能力映射文档与演示脚本
+88ff844 M9: 观测埋点、指标接口、相关性校准与自动化测试
+60f3b44 M7-M8: Agent 确认流程、流式问答与 Streamlit 界面
+6df8d55 M0-M6: 完成 RAG 检索与 FastAPI 服务，M7 进行中
+```
+
+**最终形态**
+- 11 个接口路径、6 张表、8 个自动化测试、14 条评测集
+- 三份对外文档：`docs/architecture.md`（分层 + 时序 + 决策代价）、`docs/demo.md`（5 分钟演示）、`docs/fde-mapping.md`（能力 → 证据）
+- 演示脚本 `scripts/demo_walkthrough.py`：服务未启动时明确提示并退出码 2；正常运行退出码 0
+
+**可选后续（不属于计划内里程碑）**
+1. 推到 GitHub（当前只有本地仓库；注意 `models/`、`data/` 已被忽略）
+2. 加鉴权与限流（`session_id` 目前可伪造，但只能确认自己的单）
+3. Agent 跨轮历史（`agent_messages` 表，需处理历史长度/截断/注入）
+4. 扩大知识库与评测集后重新校准相关性门槛
+5. 并发模型升级（异步客户端 + 连接池）
+
+### 11.41 后续能力：Agent 跨轮历史 + 流式异步并发（2026-11-18）
+
+#### Agent 跨轮历史
+
+**新增**：`agent_messages` 表（`session_id/role/content`，只存 user/assistant 自然语言）；
+仓储 `add_agent_message` / `list_agent_messages` / `clear_agent_messages`；
+`loop.py` 增加 `_load_history`（字符预算截断）与 `_remember`（写回 assistant 结果）；
+`confirm.py` 在**状态真正变化**时写一条结果说明；新增 `POST /agent/reset`，Streamlit「清空对话」同步清服务端。
+
+**为什么不存 tool_calls/tool 结果**：写操作提议那一轮的 assistant 带 `tool_calls` 但没有对应 `tool` 结果，直接回放会破坏协议；跨轮真正需要的是"上一轮聊了什么"。代价是模型不知道上一轮调过哪些工具。
+
+**截断策略**：先按条数（默认 10），再按字符（默认 3000）从新往旧累加，超限丢更早的。`AGENT_HISTORY_MESSAGES` / `AGENT_HISTORY_MAX_CHARS` 可调。
+
+**实测（真实模型，两轮同一 session）**
+```text
+轮1 "订单 O001 现在什么状态" → get_order，答"已付款 299 元 顺丰…"
+轮2 "那能退吗？"             → search_knowledge ×2，直接按 O001 语境回答退货政策，没有反问"哪个订单"
+```
+
+#### 流式异步并发
+
+**改动**
+- `client.py`：抽出 `_validate_completion` 供同步/异步共用；新增 `achat` 与 `achat_stream`（`httpx.AsyncClient`）。
+- `/ask/stream` 改为 `async def`：`is_relevant`、`search_hybrid`、`record_trace_detached` 全部 `run_in_threadpool`；文本用 `async for` 消费。
+- 关键原则：**异步只对 IO 等待有效**；jieba/BM25/embedding 是 CPU 计算，必须丢线程池，否则比同步更糟。
+
+**并发实测（测试内打桩，不联网）**
+```text
+8 个并发 /ask/stream，每次 achat_stream 模拟 3×100ms
+串行预期 ≈ 2.4s；实测 < 1.2s（断言阈值），事件循环未被阻塞
+```
+
+**保留的同步部分**：`/agent/chat` 仍同步——工具与 SQLite 都是同步库，异步化需要 aiosqlite，收益/复杂度不划算；文档里写明。
+
+**测试**：新增 `tests/test_agent_features.py`（历史传递、字符预算、pending 记历史、8 并发、reset），总计 13 passed。

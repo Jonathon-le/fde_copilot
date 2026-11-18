@@ -16,7 +16,7 @@ python -m scripts.build_index      # 建向量库（34 chunks）
 python -m scripts.ticket_cli init-db
 ```
 
-预期：`data/chroma/` 出现，`data/app.db` 里有 6 张表（customers/orders/tickets/ticket_events/pending_actions/traces）+ 种子工单。
+预期：`data/chroma/` 出现，`data/app.db` 里有 7 张表（customers/orders/tickets/ticket_events/pending_actions/traces/agent_messages）+ 种子工单。
 
 ## 1. 启动（💤）
 
@@ -108,7 +108,7 @@ python -c "import httpx;r=httpx.post('http://127.0.0.1:8000/tickets',json={'cust
 ## 8. 测试与评测（💤，全部不联网）
 
 ```powershell
-python -m pytest -q                    # 8 passed
+python -m pytest -q                    # 13 passed（含 8 并发流式测试）
 python -m scripts.eval_retrieval       # 三模式 hit@1 / recall@4 表
 python -m scripts.calibrate_relevance  # 输出"不可分"的校准结论
 python -m scripts.eval_report          # 重新生成 data/eval/report.md

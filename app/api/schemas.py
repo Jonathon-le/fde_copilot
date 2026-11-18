@@ -178,3 +178,12 @@ class AgentConfirmResponse(BaseModel):
     pending_id: str
     status: Literal["executed", "failed", "rejected"]
     result: dict | None = None
+
+
+class AgentResetRequest(BaseModel):
+    """清空某个会话的 Agent 历史。
+
+    session_id 在这里既是定位键也是凭据：知道它的人能清掉自己的历史，
+    和 /agent/confirm 的权限模型一致（本机单用户场景）。
+    """
+    session_id: str = Field(min_length=4, max_length=64)

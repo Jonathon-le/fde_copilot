@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import time
 
@@ -39,6 +40,11 @@ _MAX_TOOL_RESULT_CHARS = 2000
 
 # 一个会话最多堆多少个待确认操作。防模型连环提议，把确认页刷爆。
 MAX_PENDING_PER_SESSION = 5
+
+# 跨轮历史：最多带多少条、总字符上限多少。
+# 字符上限比条数更关键：一条长答案可能就占满上下文。
+HISTORY_MESSAGES = int(os.getenv("AGENT_HISTORY_MESSAGES", "10"))
+HISTORY_MAX_CHARS = int(os.getenv("AGENT_HISTORY_MAX_CHARS", "3000"))
 
 
 def _tool_message_payload(result: dict) -> str:
@@ -92,6 +98,47 @@ def _pending_payload(row: dict) -> dict:
     }
 
 
+def _load_history(conn: sqlite3.Connection, session_id: str) -> list[dict]:
+    """读取该会话最近的历史消息，并做字符上限截断。
+
+    截断策略：从最新往回累加，超限就丢更早的。
+    不能简单按条数——一条长答案可能比十条短消息更占上下文。
+    """
+    rows = repo.list_agent_messages(conn, session_id, limit=HISTORY_MESSAGES)
+    kept: list[dict] = []
+    total = 0
+    for row in reversed(rows):                 # 从新到旧累加
+        total += len(row["content"])
+        if total > HISTORY_MAX_CHARS:
+            break
+        kept.append({"role": row["role"], "content": row["content"]})
+    return list(reversed(kept))                # 还给模型时旧的在前
+
+
+def _remember(conn: sqlite3.Connection, session_id: str, result: dict) -> dict:
+    """把这一轮的结论写进历史，再原样返回 result。
+
+    只记自然语言：
+    - 正常回答记 assistant 的 answer；
+    - 有待确认单时记一句"已生成待确认操作"，让下一轮知道刚才发生了什么。
+    tool_calls 和工具结果不入库——它们只在当轮有效。
+    """
+    pending = result.get("pending")
+    if pending:
+        note = f"已生成待确认操作：{pending['tool']}（{pending['pending_id']}），等待用户确认。"
+        try:
+            repo.add_agent_message(conn, session_id=session_id, role="assistant", content=note)
+        except Exception:
+            logger.exception("save agent history failed")
+    elif result.get("answer"):
+        try:
+            repo.add_agent_message(conn, session_id=session_id, role="assistant",
+                                   content=result["answer"])
+        except Exception:
+            logger.exception("save agent history failed")
+    return result
+
+
 def run_agent(
     conn: sqlite3.Connection,
     *,
@@ -106,10 +153,19 @@ def run_agent(
     - steps ：每一步调了哪个工具、成功与否、耗时（M9 的 trace 雏形）
     - pending：有写操作等待确认时非空；此时 answer 可能为空
     """
+    # 跨轮历史：把最近几轮 user/assistant 对话拼在 system 之后。
+    # 注意顺序：旧的在前，本轮的 user 永远在最后。
+    history = _load_history(conn, session_id)
     messages: list[dict] = [
         {"role": "system", "content": SYSTEM_PROMPT},
+        *history,
         {"role": "user", "content": message},
     ]
+    try:
+        repo.add_agent_message(conn, session_id=session_id, role="user", content=message)
+    except Exception:
+        # 历史写失败不能影响本轮对话
+        logger.exception("save user message failed")
     # 读工具和写工具都要给模型看：模型得知道"可以建单"，才会提议建单。
     # 但"能不能建"不取决于它看到了什么，而取决于确认流程（见 confirm.py）。
     tools = schema_for_model({**READ_TOOLS, **WRITE_TOOLS})
@@ -145,21 +201,21 @@ def run_agent(
                     "elapsed_ms": int((time.perf_counter() - started) * 1000),
                     "action": "repeat_abort",
                 })
-                return {
+                return _remember(conn, session_id, {
                     "answer": "同一个查询已经重复执行，我先停下。请补充更具体的信息。",
                     "steps": steps,
                     "pending": None,
-                }
+                })
 
             # --- 2) 写工具：不执行，落成待确认操作，本轮结束 ---
             # 这是整个 M7 的安全边界：模型只能"提议"，不能"落库"。
             if name in WRITE_TOOLS:
                 if repo.count_pending(conn, session_id) >= MAX_PENDING_PER_SESSION:
-                    return {
+                    return _remember(conn, session_id, {
                         "answer": "待确认的操作太多了，请先处理已有确认单。",
                         "steps": steps,
                         "pending": None,
-                    }
+                    })
                 row = repo.create_pending(
                     conn, session_id=session_id, tool_name=name, arguments=args
                 )
@@ -167,11 +223,11 @@ def run_agent(
                     "step": step, "tool": name, "args": args, "ok": True,
                     "elapsed_ms": 0, "action": "pending",
                 })
-                return {
+                return _remember(conn, session_id, {
                     "answer": last_answer,
                     "steps": steps,
                     "pending": _pending_payload(row),
-                }
+                })
 
             # --- 3) 读工具：白名单内的直接执行 ---
             if name not in READ_TOOLS:
@@ -196,4 +252,4 @@ def run_agent(
     else:
         last_answer = "这个问题需要的步骤过多，我先停下。请补充更具体的信息（比如订单号）。"
 
-    return {"answer": last_answer, "steps": steps, "pending": None}
+    return _remember(conn, session_id, {"answer": last_answer, "steps": steps, "pending": None})

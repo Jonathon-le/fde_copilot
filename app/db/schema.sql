@@ -80,3 +80,15 @@ CREATE TABLE IF NOT EXISTS traces(
 );
 CREATE INDEX IF NOT EXISTS idx_traces_created ON traces(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_traces_kind ON traces(kind, created_at DESC);
+
+-- Agent 会话历史：只存自然语言轮次（user/assistant），不存 tool_calls/tool 结果。
+-- 为什么不存完整消息：写操作提议时 assistant 带 tool_calls 但没有对应 tool 结果，
+-- 直接回放会破坏协议；而跨轮真正需要的是"上一轮聊了什么"。
+CREATE TABLE IF NOT EXISTS agent_messages(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    role TEXT NOT NULL CHECK(role in('user','assistant')),
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_messages_session ON agent_messages(session_id, id);

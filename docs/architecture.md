@@ -127,7 +127,7 @@ sequenceDiagram
 | **写操作两阶段确认** | 模型输出不可信，不能直接触发副作用 | 交互多一步；需要 pending 表和状态机 |
 | **pending 落库，不内存** | `--reload` 重启、多 worker、崩溃都会丢内存待办 | 每步多一次数据库往返 |
 | **越权返回 404 而非 403** | 403 等于告诉对方"这个 id 存在" | 排查时需要看日志才知道是越权还是不存在 |
-| **路由全部 `def`** | 依赖都是同步库（httpx/sqlite/jieba），async 会阻塞事件循环 | 并发上限是线程池（约 40） |
+| **只有 `/ask/stream` 是 `async def`** | 它主要是 IO 等待，用 `AsyncClient` 时线程不被占用；检索与写库用 `run_in_threadpool` 丢回线程池 | 多一层调度；`/agent/chat` 仍是同步（SQLite/工具都是同步库） |
 | **流式 trace 用独立连接** | `yield` 依赖在路由返回时关闭，流在返回后才产生 | 多一次建连，代码多一条路径 |
 | **相关性门槛默认关闭** | 评测集上 absent 与 in-domain 分数重叠（0.5842 vs 0.5728），无可用阈值 | 库外问题仍会返回 top-k，靠 prompt 拒答 |
 | **前端只走 HTTP** | 换前端/加鉴权/拆服务不用动业务代码 | 前端无法复用类型，需要手写 schema |
@@ -141,6 +141,7 @@ customers ──< orders
                        │
 pending_actions ───────┘  （独立表：session_id/tool/arguments/status/result）
 traces                      （独立表：kind/status/latency/steps/payload）
+agent_messages              （独立表：session_id/role/content，只存自然语言轮次）
 ```
 
 - `pending_actions.status`：`pending → confirmed → executed | failed`，另有 `rejected` / `expired`

@@ -72,7 +72,8 @@ python -m streamlit run app/ui/streamlit_app.py
 | 写操作两阶段确认 | 模型输出不可信，不能直接触发副作用 | 交互多一步，需要 pending 表 |
 | `pending_actions` 落库 | `--reload`、多 worker、崩溃都会丢内存待办 | 每次多一次数据库往返 |
 | 越权返回 404 而非 403 | 403 等于确认"这个 id 存在" | 排查时需看日志区分 |
-| 路由全部 `def` | 依赖都是同步库，`async def` 会阻塞事件循环 | 并发上限约为线程池大小 |
+| 只有 `/ask/stream` 是 `async def` | 它只做 IO 等待，用 `AsyncClient` 不占线程；检索/写库用 `run_in_threadpool` 丢回线程池 | 多一层调度，代码略复杂 |
+| Agent 跨轮历史只存自然语言 | 带 `tool_calls` 的未完成回合回放会破坏协议 | 模型不知道上一轮调过哪些工具 |
 | 流式 trace 用独立连接 | 请求级 `yield` 依赖在流开始前就关闭 | 多一次建连 |
 
 ## 评测（诚实版）
@@ -90,7 +91,7 @@ python -m streamlit run app/ui/streamlit_app.py
 ## 测试与脚本
 
 ```powershell
-python -m pytest -q                    # 8 个测试，不联网、不调模型
+python -m pytest -q                    # 13 个测试，不联网、不调模型
 python -m scripts.eval_retrieval       # 三模式 hit@1 / recall@k
 python -m scripts.calibrate_relevance  # 分数分布与可分性判定
 python -m scripts.eval_report          # 重新生成评测报告
@@ -117,9 +118,9 @@ tests/     核心回归测试
 
 - **评测规模小**：34 chunk / 14 query，数字只能作方向参考。
 - **无相关性门槛**：库外问题仍返回 top-k，靠 prompt 拒答；`RELEVANCE_MIN_SCORE` 可强制开启但会误拒。
-- **Agent 无跨轮历史**：`session_id` 只绑定待确认单，"那帮我退了吧"会丢指代。
+- **Agent 历史有限**：只存最近 10 条、3000 字符的自然语言轮次（`AGENT_HISTORY_*` 可调），不含工具调用记录。
 - **单机、无鉴权、无限流**：`session_id` 可伪造（但只能确认自己的待办）。
-- **同步并发模型**：线程池约 40，高并发需异步客户端。
+- **并发分层**：`/ask/stream` 用异步客户端，等待模型时不占线程；`/agent/chat` 仍同步（工具与 SQLite 都是同步库），并发上限约为线程池大小。
 
 ## 延伸材料
 
