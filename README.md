@@ -127,4 +127,4 @@ tests/     核心回归测试
 - [docs/architecture.md](docs/architecture.md) — 分层、时序、决策与代价
 - [docs/demo.md](docs/demo.md) — 5 分钟演示
 - [docs/fde-mapping.md](docs/fde-mapping.md) — 能力 → 项目证据
-- `fde_copilot项目完成时遇到的问题和以后理解项目需要重点理解的点.md` — 按里程碑记录的工程日志（踩坑与修正）
+- `MILESTONES/` — 每个里程碑的任务卡、验收标准与自测题
